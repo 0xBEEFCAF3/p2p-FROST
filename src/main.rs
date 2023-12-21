@@ -1,6 +1,10 @@
-
 use futures::stream::StreamExt;
+use libp2p::{Swarm, PeerId};
+use libp2p::gossipsub::{Topic};
 use libp2p::{gossipsub, mdns, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux};
+use log::{error, info, debug};
+use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
 use std::hash::{Hash, Hasher};
@@ -10,9 +14,70 @@ use tracing_subscriber::EnvFilter;
 
 // We create a custom network behaviour that combines Gossipsub and Mdns.
 #[derive(NetworkBehaviour)]
-struct MyBehaviour {
+struct FrostBehaviour {
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+enum EventResponseType {
+    Pong,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Response {
+    response_type: EventResponseType,
+    data: Option<String>,
+    // peer id for who should recieve
+    receiver: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq)]
+enum EventRequestType {
+    Ping,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Request {
+    request_type: EventRequestType,
+    data: Option<String>,
+}
+
+#[derive(Debug)]
+enum EventType {
+    Response(Response),
+    Input(String),
+}
+
+async fn handle_ping<H: libp2p::gossipsub::Hasher>(swarm: &mut Swarm<FrostBehaviour>, topic: Topic<H>) {
+    info!("Sending Ping");
+    let request = Request {
+        request_type: EventRequestType::Ping,
+        data: None,
+    };
+    let json = serde_json::to_string(&request).expect("can jsonify request");
+
+    debug!("json: {}", json);
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .publish(topic, json.as_bytes());
+}
+
+async fn handle_pong<H: libp2p::gossipsub::Hasher>(swarm: &mut Swarm<FrostBehaviour>, topic: Topic<H>, peer_id: PeerId) {
+    info!("Sending Pong");
+    let request = Response {
+        response_type: EventResponseType::Pong,
+        receiver: peer_id.to_string(),
+        data: None,
+    };
+    let json = serde_json::to_string(&request).expect("can jsonify request");
+
+    debug!("json: {}", json);
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .publish(topic, json.as_bytes());
 }
 
 #[tokio::main]
@@ -53,13 +118,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             let mdns =
                 mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
-            Ok(MyBehaviour { gossipsub, mdns })
+            Ok(FrostBehaviour { gossipsub, mdns })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
 
     // Create a Gossipsub topic
-    let topic = gossipsub::IdentTopic::new("test-net");
+    let topic = gossipsub::IdentTopic::new("frost");
     // subscribes to our topic
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
@@ -83,6 +148,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             println!("{:?}", peer);
                         }
                     }
+                    "ping" => {
+                        handle_ping(&mut swarm, topic.clone()).await;
+                    }
                     _ => println!("Sending message: {}", line),
                 }
                 if let Err(e) = swarm
@@ -92,29 +160,51 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
             }
             event = swarm.select_next_some() => match event {
-                SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
+                SwarmEvent::Behaviour(FrostBehaviourEvent::Mdns(mdns::Event::Discovered(list))) => {
                     for (peer_id, _multiaddr) in list {
                         println!("mDNS discovered a new peer: {peer_id}");
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
                     }
                 },
-                SwarmEvent::Behaviour(MyBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
+                SwarmEvent::Behaviour(FrostBehaviourEvent::Mdns(mdns::Event::Expired(list))) => {
                     for (peer_id, _multiaddr) in list {
                         println!("mDNS discover peer has expired: {peer_id}");
                         swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                     }
                 },
-                SwarmEvent::Behaviour(MyBehaviourEvent::Gossipsub(gossipsub::Event::Message {
+                SwarmEvent::NewListenAddr { address, .. } => {
+                    println!("Local node is listening on {address}");
+                },
+                SwarmEvent::Behaviour(FrostBehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     propagation_source: peer_id,
                     message_id: id,
                     message,
-                })) => println!(
+                })) => {
+
+                    info!(
                         "Got message: '{}' with id: {id} from peer: {peer_id}",
                         String::from_utf8_lossy(&message.data),
-                    ),
-                SwarmEvent::NewListenAddr { address, .. } => {
-                    println!("Local node is listening on {address}");
-                }
+                    );
+                    if let Ok(req) = serde_json::from_slice::<Request>(&message.data) {
+                        match req.request_type {
+                            EventRequestType::Ping => {
+                                info!("Got ping from peer: {peer_id}");
+                                handle_pong(&mut swarm, topic.clone(), peer_id).await;
+                            }
+                        }
+                    } else if let Ok(resp) = serde_json::from_slice::<Response>(&message.data) {
+                        if resp.receiver == swarm.local_peer_id().to_string() {
+                            info!("Got response from peer: {peer_id}");
+                            match resp.response_type {
+                                EventResponseType::Pong => {
+                                    info!("Got pong from peer: {peer_id}");
+                                }
+                            }
+                        }
+                    }
+                    
+                },
+
                 _ => {}
             }
         }
