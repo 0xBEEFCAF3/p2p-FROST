@@ -11,3 +11,6 @@ serde_json = "1.0"
 once_cell = "1.5"
 log = "0.4"
 pretty_env_logger = "0.4"
+
+# Frost
+frost-secp256k1 = { version = "0.7.0", features = ["serde"] }
