@@ -1,18 +1,88 @@
 use futures::stream::StreamExt;
-use libp2p::{Swarm, PeerId};
-use libp2p::gossipsub::{Topic};
+use libp2p::gossipsub::Topic;
 use libp2p::{gossipsub, mdns, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux};
-use log::{error, info, debug};
-use once_cell::sync::Lazy;
+use libp2p::{PeerId, Swarm};
+use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
+use std::vec;
 use tokio::{io, io::AsyncBufReadExt, select};
 use tracing_subscriber::EnvFilter;
 
-// We create a custom network behaviour that combines Gossipsub and Mdns.
+use frost_secp256k1 as frost;
+use rand::thread_rng;
+
+// Dkg Fsm states
+
+// Define the events that can trigger state transitions
+#[derive(Debug, Clone, PartialEq)]
+pub enum DKGEvent {
+    Start,
+    Stop,
+    Pause,
+    Resume,
+}
+
+// Define the states of the state machine
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DKGState {
+    Initial,
+    Running,
+    Paused,
+    Stopped,
+}
+
+// Implement the state machine using rust-fsm
+#[derive(Debug)]
+struct DKGStateMachine {
+    state: DKGState,
+    min_signers: u16,
+    max_signers: u16,
+    personal_identifier: frost::Identifier,
+    personal_secret_package: frost::keys::dkg::round1::SecretPackage,
+    personal_round1_package: frost::keys::dkg::round1::Package, 
+    group_packages: Vec<frost::keys::dkg::round1::Package>,
+}
+
+impl DKGStateMachine {
+    pub fn new(min_signers: u16, max_signers: u16, personal_id_bytes: &[u8]) -> Self {
+        let mut rng = thread_rng();
+        let personal_identifier =
+            frost::Identifier::derive(personal_id_bytes).expect("can derive identifier");
+        let (personal_secret_package, personal_round1_package) =
+            frost::keys::dkg::part1(personal_identifier, min_signers, max_signers, &mut rng)
+                .unwrap();
+        Self {
+            state: DKGState::Initial,
+            min_signers,
+            max_signers,
+            personal_secret_package,
+            personal_round1_package,
+            personal_identifier,
+            group_packages: vec![],
+        }
+    }
+}
+
+impl DKGStateMachine {
+    fn next_state<H: libp2p::gossipsub::Hasher>(&mut self, event: DKGEvent, swarm: &mut Swarm<FrostBehaviour>, topic: Topic<H>) {
+        match (self.state, event) {
+            // Define state transitions based on events
+            (DKGState::Initial, DKGEvent::Start) => {
+                info!("Starting DKG");
+
+                // Notify all peers about our round one package
+
+                self.state = DKGState::Running;
+            }
+            _ => panic!("Invalid transition"),
+        }
+    }
+}
+
 #[derive(NetworkBehaviour)]
 struct FrostBehaviour {
     gossipsub: gossipsub::Behaviour,
@@ -22,6 +92,7 @@ struct FrostBehaviour {
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 enum EventResponseType {
     Pong,
+    DKG_round_1,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -35,6 +106,8 @@ struct Response {
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 enum EventRequestType {
     Ping,
+    // Event for everyone to start DKG by sharing their coefficients
+    DKG_round_1,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,7 +122,10 @@ enum EventType {
     Input(String),
 }
 
-async fn handle_ping<H: libp2p::gossipsub::Hasher>(swarm: &mut Swarm<FrostBehaviour>, topic: Topic<H>) {
+async fn handle_ping<H: libp2p::gossipsub::Hasher>(
+    swarm: &mut Swarm<FrostBehaviour>,
+    topic: Topic<H>,
+) {
     info!("Sending Ping");
     let request = Request {
         request_type: EventRequestType::Ping,
@@ -64,7 +140,11 @@ async fn handle_ping<H: libp2p::gossipsub::Hasher>(swarm: &mut Swarm<FrostBehavi
         .publish(topic, json.as_bytes());
 }
 
-async fn handle_pong<H: libp2p::gossipsub::Hasher>(swarm: &mut Swarm<FrostBehaviour>, topic: Topic<H>, peer_id: PeerId) {
+async fn handle_pong<H: libp2p::gossipsub::Hasher>(
+    swarm: &mut Swarm<FrostBehaviour>,
+    topic: Topic<H>,
+    peer_id: PeerId,
+) {
     info!("Sending Pong");
     let request = Response {
         response_type: EventResponseType::Pong,
@@ -118,6 +198,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
             let mdns =
                 mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
+
             Ok(FrostBehaviour { gossipsub, mdns })
         })?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
@@ -125,6 +206,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Create a Gossipsub topic
     let topic = gossipsub::IdentTopic::new("frost");
+    let mut dkg_state_machine =
+        &mut DKGStateMachine::new(2, 2, swarm.local_peer_id().to_bytes().as_ref());
+
+    println!("dkg_state_machine: {:?}", dkg_state_machine);
+
     // subscribes to our topic
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
@@ -150,6 +236,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                     "ping" => {
                         handle_ping(&mut swarm, topic.clone()).await;
+                    }
+                    "dkg" => {
+                        dkg_state_machine.next_state(DKGEvent::Start, &mut swarm, topic.clone());
                     }
                     _ => println!("Sending message: {}", line),
                 }
@@ -202,7 +291,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             }
                         }
                     }
-                    
+
                 },
 
                 _ => {}
