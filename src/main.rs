@@ -21,18 +21,20 @@ use rand::thread_rng;
 #[derive(Debug, Clone, PartialEq)]
 pub enum DKGEvent {
     Start,
-    Stop,
-    Pause,
-    Resume,
+    Round1,
+    Round2,
+    Round3,
+    DKGFailed,
 }
 
 // Define the states of the state machine
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DKGState {
     Initial,
-    Running,
-    Paused,
-    Stopped,
+    Round1,
+    Round2,
+    Round3,
+    DkgFailed,
 }
 
 // Implement the state machine using rust-fsm
@@ -43,7 +45,7 @@ struct DKGStateMachine {
     max_signers: u16,
     personal_identifier: frost::Identifier,
     personal_secret_package: frost::keys::dkg::round1::SecretPackage,
-    personal_round1_package: frost::keys::dkg::round1::Package, 
+    personal_round1_package: frost::keys::dkg::round1::Package,
     group_packages: Vec<frost::keys::dkg::round1::Package>,
 }
 
@@ -68,16 +70,31 @@ impl DKGStateMachine {
 }
 
 impl DKGStateMachine {
-    fn next_state<H: libp2p::gossipsub::Hasher>(&mut self, event: DKGEvent, swarm: &mut Swarm<FrostBehaviour>, topic: Topic<H>) {
+    fn next_state<H: libp2p::gossipsub::Hasher>(
+        &mut self,
+        event: DKGEvent,
+        swarm: &mut Swarm<FrostBehaviour>,
+        topic: Topic<H>,
+    ) {
         match (self.state, event) {
             // Define state transitions based on events
-            (DKGState::Initial, DKGEvent::Start) => {
-                info!("Starting DKG");
+            (DKGState::Initial, DKGEvent::Round1) => {
+                info!("Starting DKG, sending round 1 package to all peers");
+                let topic_hash = topic.hash();
+                let request = Request {
+                    request_type: EventRequestType::DkgRound1,
+                    data: Some(
+                        serde_json::to_string(&self.personal_round1_package)
+                            .expect("can jsonify request"),
+                    ),
+                };
+                let json = serde_json::to_string(&request).expect("can jsonify request");
+                // Broadcast to all peers
+                swarm.behaviour_mut().gossipsub.publish(topic_hash.clone(), json.as_bytes());
 
-                // Notify all peers about our round one package
-
-                self.state = DKGState::Running;
+                self.state = DKGState::Round1;
             }
+            // TODO for round 2, 3
             _ => panic!("Invalid transition"),
         }
     }
@@ -89,16 +106,22 @@ struct FrostBehaviour {
     mdns: mdns::tokio::Behaviour,
 }
 
+// Response Structs
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 enum EventResponseType {
     Pong,
-    DKG_round_1,
+    DkgRound1,
+}
+
+struct DKGRound1ResponsePackage {
+    from_peer_id: String,
+    package: frost::keys::dkg::round1::Package,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Response {
+struct Response<T> {
     response_type: EventResponseType,
-    data: Option<String>,
+    data: Option<T>,
     // peer id for who should recieve
     receiver: String,
 }
@@ -107,19 +130,14 @@ struct Response {
 enum EventRequestType {
     Ping,
     // Event for everyone to start DKG by sharing their coefficients
-    DKG_round_1,
+    DkgRound1,
 }
 
+// Request structs
 #[derive(Debug, Serialize, Deserialize)]
-struct Request {
+struct Request<T> {
     request_type: EventRequestType,
-    data: Option<String>,
-}
-
-#[derive(Debug)]
-enum EventType {
-    Response(Response),
-    Input(String),
+    data: Option<T>,
 }
 
 async fn handle_ping<H: libp2p::gossipsub::Hasher>(
@@ -127,7 +145,7 @@ async fn handle_ping<H: libp2p::gossipsub::Hasher>(
     topic: Topic<H>,
 ) {
     info!("Sending Ping");
-    let request = Request {
+    let request: Request<Option<String>> = Request {
         request_type: EventRequestType::Ping,
         data: None,
     };
@@ -146,7 +164,7 @@ async fn handle_pong<H: libp2p::gossipsub::Hasher>(
     peer_id: PeerId,
 ) {
     info!("Sending Pong");
-    let request = Response {
+    let request: Response<Option<String>> = Response {
         response_type: EventResponseType::Pong,
         receiver: peer_id.to_string(),
         data: None,
@@ -206,7 +224,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Create a Gossipsub topic
     let topic = gossipsub::IdentTopic::new("frost");
-    let mut dkg_state_machine =
+    let dkg_state_machine =
         &mut DKGStateMachine::new(2, 2, swarm.local_peer_id().to_bytes().as_ref());
 
     println!("dkg_state_machine: {:?}", dkg_state_machine);
@@ -238,7 +256,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         handle_ping(&mut swarm, topic.clone()).await;
                     }
                     "dkg" => {
-                        dkg_state_machine.next_state(DKGEvent::Start, &mut swarm, topic.clone());
+                        dkg_state_machine.next_state(DKGEvent::Round1, &mut swarm, topic.clone());
                     }
                     _ => println!("Sending message: {}", line),
                 }
@@ -274,19 +292,34 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         "Got message: '{}' with id: {id} from peer: {peer_id}",
                         String::from_utf8_lossy(&message.data),
                     );
-                    if let Ok(req) = serde_json::from_slice::<Request>(&message.data) {
+                    if let Ok(req) = serde_json::from_slice::<Request<Option<String>>>(&message.data) {
                         match req.request_type {
                             EventRequestType::Ping => {
                                 info!("Got ping from peer: {peer_id}");
                                 handle_pong(&mut swarm, topic.clone(), peer_id).await;
                             }
+                            EventRequestType::DkgRound1 => {
+                                info!("Got DKG round 1 from peer: {peer_id}");
+                                if peer_id == *swarm.local_peer_id() {
+                                    debug!("Got our own round 1 package back");
+                                    continue;
+                                }
+                                // A peer is requesting to start DKG
+                                // Assuming we are in init state, otherwise we shouldnt ignore
+                                dkg_state_machine.next_state(DKGEvent::Round1, &mut swarm, topic.clone());
+                            }
                         }
-                    } else if let Ok(resp) = serde_json::from_slice::<Response>(&message.data) {
+                    } else if let Ok(resp) = serde_json::from_slice::<Response<Option<String>>>(&message.data) {
                         if resp.receiver == swarm.local_peer_id().to_string() {
                             info!("Got response from peer: {peer_id}");
                             match resp.response_type {
                                 EventResponseType::Pong => {
                                     info!("Got pong from peer: {peer_id}");
+                                }
+                                EventResponseType::DkgRound1 => {
+                                    info!("Got DKG round 1 from peer: {peer_id}");
+                                    
+                                    todo!();
                                 }
                             }
                         }
