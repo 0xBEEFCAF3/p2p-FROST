@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
-use std::f32::consts::E;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
 use std::time::Duration;
@@ -112,6 +111,18 @@ struct FrostBehaviour {
 enum EventResponseType {
     Pong,
     DkgRound1,
+}
+
+impl FromStr for EventResponseType {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Pong" => Ok(EventResponseType::Pong),
+            "DkgRound1" => Ok(EventResponseType::DkgRound1),
+            _ => Err(()),
+        }
+    }
 }
 
 struct DKGRound1ResponsePackage {
@@ -220,6 +231,38 @@ async fn handle_request(
                 // A peer is requesting to start DKG
                 // Assuming we are in init state, otherwise we shouldnt ignore
                 dkg_state_machine.next_state(DKGEvent::Round1, swarm, topic);
+            }
+        }
+        return Ok(());
+    }
+
+    Err(RequestResponseParsingError::UnableToParse)
+}
+
+async fn handle_response(
+    payload: Vec<u8>,
+    dkg_state_machine: &mut DKGStateMachine,
+    swarm: &mut Swarm<FrostBehaviour>,
+    topic: TopicHash,
+    peer_id: PeerId,
+) -> Result<(), RequestResponseParsingError> {
+    let parsed: Value =
+        serde_json::from_slice(&payload).map_err(|e| RequestResponseParsingError::UnableToParse)?;
+    if let Some(request_type) = parsed.get("response_type").and_then(|v| v.as_str()) {
+        // parse back into enum variant
+        let req_type = request_type
+            .parse::<EventResponseType>()
+            .map_err(|e| RequestResponseParsingError::UnableToParse)?;
+
+        println!("req_type: {:?}", req_type);
+
+        match req_type {
+            EventResponseType::Pong => {
+                info!("Got pong from peer: {peer_id}");
+                // Nothing else to do
+            }
+            EventResponseType::DkgRound1 => {
+                todo!();
             }
         }
         return Ok(());
@@ -344,23 +387,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     );
                     if let Ok(_) = handle_request(message.data.clone(), dkg_state_machine, &mut swarm, topic.hash(), peer_id).await {
                         info!("Successfully handled request");
+                    } else if let Ok(_) = handle_response(message.data.clone(), dkg_state_machine, &mut swarm, topic.hash(), peer_id).await {
+                        info!("Successfully handled response");
+                    } else {
+                        info!("Unable to handle request or response");
                     }
-                    // if let Ok(resp) = serde_json::from_slice::<Response<Option<String>>>(&message.data) {
-                    //     if resp.receiver == swarm.local_peer_id().to_string() {
-                    //         info!("Got response from peer: {peer_id}");
-                    //         match resp.response_type {
-                    //             EventResponseType::Pong => {
-                    //                 info!("Got pong from peer: {peer_id}");
-                    //             }
-                    //             EventResponseType::DkgRound1 => {
-                    //                 info!("Got DKG round 1 from peer: {peer_id}");
-
-                    //                 todo!();
-                    //             }
-                    //         }
-                    //     }
-                    // }
-
                 },
 
                 _ => {}
