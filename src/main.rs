@@ -1,5 +1,6 @@
+use frost::Identifier;
 use futures::stream::StreamExt;
-use libp2p::gossipsub::{Topic, TopicHash};
+use libp2p::gossipsub::{Event, Topic, TopicHash};
 use libp2p::{gossipsub, mdns, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux};
 use libp2p::{PeerId, Swarm};
 use log::{debug, error, info};
@@ -35,8 +36,10 @@ pub enum DKGEvent {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DKGState {
     Initial,
-    Round1,
-    Round2,
+    Round1Start,
+    Round1Waiting,
+    Round2Start,
+    Round2Waiting,
     Round3,
     DkgFailed,
 }
@@ -50,7 +53,9 @@ struct DKGStateMachine {
     personal_identifier: frost::Identifier,
     personal_secret_package: frost::keys::dkg::round1::SecretPackage,
     personal_round1_package: frost::keys::dkg::round1::Package,
-    group_packages: HashMap<frost::Identifier, frost::keys::dkg::round1::Package>,
+    round1_group_packages: HashMap<frost::Identifier, frost::keys::dkg::round1::Package>,
+    round2_group_packages: HashMap<frost::Identifier, frost::keys::dkg::round2::Package>,
+    round2_group_secret_package: Option<frost::keys::dkg::round2::SecretPackage>,
 }
 
 fn peer_id_to_identifier(peer_id: &PeerId) -> frost::Identifier {
@@ -61,6 +66,7 @@ impl DKGStateMachine {
     pub fn new(min_signers: u16, max_signers: u16, peer_id: &PeerId) -> Self {
         let mut rng = thread_rng();
         let personal_identifier = peer_id_to_identifier(peer_id);
+        info!("personal_identifier: {:?}", personal_identifier);
         let (personal_secret_package, personal_round1_package) =
             frost::keys::dkg::part1(personal_identifier, min_signers, max_signers, &mut rng)
                 .unwrap();
@@ -71,7 +77,9 @@ impl DKGStateMachine {
             personal_secret_package,
             personal_round1_package,
             personal_identifier,
-            group_packages: HashMap::new(),
+            round1_group_packages: HashMap::new(),
+            round2_group_packages: HashMap::new(),
+            round2_group_secret_package: None,
         }
     }
 }
@@ -80,9 +88,8 @@ impl DKGStateMachine {
     fn next_state(&mut self, event: DKGEvent, swarm: &mut Swarm<FrostBehaviour>, topic: TopicHash) {
         match (self.state, event) {
             // Define state transitions based on events
-            (DKGState::Initial, DKGEvent::Round1) | (DKGState::Round1, DKGEvent::Round1) => {
-                info!("GROUP PACKAGES:::: {:?}", self.group_packages);
-                self.state = DKGState::Round1;
+            (DKGState::Initial, DKGEvent::Round1) => {
+                self.state = DKGState::Round1Start;
                 info!("Starting DKG, sending round 1 package to all peers");
                 // Broadcast dkg round 1 package to all peers
                 let response = Response {
@@ -94,29 +101,86 @@ impl DKGStateMachine {
                 swarm
                     .behaviour_mut()
                     .gossipsub
-                    .publish(topic.clone(), json.as_bytes());
-                    // .unwrap();
+                    .publish(topic.clone(), json.as_bytes())
+                    .unwrap();
+                println!("Package send! {:?}", json);
+                std::thread::sleep(std::time::Duration::from_secs(1));
 
+                // Once the round 1 package is sent we are waiting
+                self.state = DKGState::Round1Waiting;
+                self.next_state(DKGEvent::Round1, swarm, topic);
+            }
+            (DKGState::Round1Waiting, DKGEvent::Round1)
+            | (DKGState::Round1Waiting, DKGEvent::Round2) => {
+                info!("Waiting for round 1 packages from other peers");
+                info!("round1_group_packages: {:?}", self.round1_group_packages);
+                // thread sleep for 1 second
+                std::thread::sleep(std::time::Duration::from_secs(1));
                 // Check if we are ready to progress to round 2
-                if self.group_packages.len() >= (self.max_signers - 1) as usize {
+                if self.round1_group_packages.len() >= (self.max_signers - 1) as usize {
                     info!("Progressing to round 2");
+                    self.state = DKGState::Round1Start;
                     self.next_state(DKGEvent::Round2, swarm, topic);
                     return;
                 }
             }
-            (DKGState::Round1, DKGEvent::Round2) => {
+            (DKGState::Round1Start, DKGEvent::Round2) => {
                 info!("Attempting to start round 2");
                 let (round2_secret_package, round2_packages) = frost::keys::dkg::part2(
                     self.personal_secret_package.clone(),
-                    &self.group_packages,
+                    &self.round1_group_packages,
                 )
                 .expect("can start round 2");
-
-
-                    
                 println!("round2_packages: {:?}", round2_packages);
+
+                self.round2_group_secret_package = Some(round2_secret_package.clone());
+                let response = Response {
+                    response_type: EventResponseType::DkgRound2,
+                    data: Some(round2_packages),
+                    receiver: None,
+                };
+                let json = serde_json::to_string(&response).expect("can jsonify request");
+                swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(topic.clone(), json.as_bytes())
+                    .unwrap();
+
+                self.state = DKGState::Round2Waiting;
+                self.next_state(DKGEvent::Round2, swarm, topic);
             }
-            // TODO for round 2, 3
+
+            (DKGState::Round2Waiting, DKGEvent::Round2) => {
+                info!("Waiting for round 2 packages from other peers");
+                info!("round2_group_packages: {:?}", self.round2_group_packages);
+                if self.round2_group_packages.len() >= (self.max_signers - 1) as usize {
+                    info!("Progressing to round 3");
+                    self.state = DKGState::Round3;
+                    self.next_state(DKGEvent::Round3, swarm, topic);
+                    return;
+                }
+                return;
+            }
+
+            (DKGState::Round3, DKGEvent::Round3) => {
+                info!("Starting round 3");
+                info!("round1 pkgs {:?}", self.round1_group_packages);
+                info!("round2 pkgs {:?}", self.round2_group_packages);
+
+                let (key_package, pubkey_package) = frost::keys::dkg::part3(
+                    &self
+                        .round2_group_secret_package
+                        .clone()
+                        .expect("valid secret package "),
+                    &self.round1_group_packages,
+                    &self.round2_group_packages,
+                )
+                .unwrap();
+
+                info!("key_package: {:?}", key_package);
+                info!("pubkey_package: {:?}", pubkey_package);
+            }
+
             _ => panic!("Invalid transition"),
         }
     }
@@ -133,6 +197,8 @@ struct FrostBehaviour {
 enum EventResponseType {
     Pong,
     DkgRound1,
+    DkgRound2,
+    DkgRound3,
 }
 
 impl FromStr for EventResponseType {
@@ -142,6 +208,8 @@ impl FromStr for EventResponseType {
         match s {
             "Pong" => Ok(EventResponseType::Pong),
             "DkgRound1" => Ok(EventResponseType::DkgRound1),
+            "DkgRound2" => Ok(EventResponseType::DkgRound2),
+            "DkgRound3" => Ok(EventResponseType::DkgRound3),
             _ => Err(()),
         }
     }
@@ -150,6 +218,11 @@ impl FromStr for EventResponseType {
 struct DKGRound1ResponsePackage {
     from_peer_id: String,
     package: frost::keys::dkg::round1::Package,
+}
+
+struct DKGRound2ResponsePackage {
+    intended_peer_id: String,
+    package: frost::keys::dkg::round2::Package,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -218,6 +291,7 @@ async fn handle_pong(swarm: &mut Swarm<FrostBehaviour>, topic: TopicHash, peer_i
 enum RequestResponseParsingError {
     UnableToParse,
     CouldNotParseRound1Package,
+    CouldNotParseRound2Package,
 }
 
 async fn handle_request(
@@ -267,6 +341,8 @@ async fn handle_response(
             .map_err(|e| RequestResponseParsingError::UnableToParse)?;
 
         debug!("resp_type: {:?}", resp_type);
+        let value = parsed.get("data").expect("can get data").to_string();
+        let package_bytes = value.as_bytes();
         match resp_type {
             EventResponseType::Pong => {
                 info!("Got pong from peer: {peer_id}");
@@ -279,8 +355,6 @@ async fn handle_response(
                     // This package should already be in our list
                     return Ok(());
                 }
-                let value = parsed.get("data").expect("can get data").to_string();
-                let package_bytes = value.as_bytes();
 
                 let package: frost::keys::dkg::round1::Package =
                     serde_json::from_slice(package_bytes).map_err(|e| {
@@ -288,9 +362,41 @@ async fn handle_response(
                         RequestResponseParsingError::CouldNotParseRound1Package
                     })?;
                 dkg_state_machine
-                    .group_packages
+                    .round1_group_packages
                     .insert(peer_id_to_identifier(&peer_id), package);
                 dkg_state_machine.next_state(DKGEvent::Round1, swarm, topic);
+            }
+            EventResponseType::DkgRound2 => {
+                info!("Got DKG round 2 from peer: {peer_id}");
+                // Check if this is intended for us
+                // let receipeint = parsed
+                //     .get("intended_peer_id")
+                //     .expect("can get receipeint")
+                //     .as_str()
+                //     .expect("can get receipeint")
+                //     .to_string();
+                // info!("receipeint: {:?}", receipeint);
+                // if receipeint != swarm.local_peer_id().to_string() {
+                //     return Ok(());
+                // }
+                let package: HashMap<Identifier, frost::keys::dkg::round2::Package> =
+                    serde_json::from_slice(package_bytes).map_err(|e| {
+                        println!("Unable to parse round 2 package: {:?}", e);
+                        RequestResponseParsingError::CouldNotParseRound1Package
+                    })?;
+
+                info!("package: {:?}", package);
+                for id in package.keys() {
+                    info!("id: {:?}", id);
+                    dkg_state_machine
+                        .round2_group_packages
+                        // TODO filter id when it matches your peer id / indentifier
+                        .insert(peer_id_to_identifier(&peer_id), package[id].clone());
+                }
+                dkg_state_machine.next_state(DKGEvent::Round2, swarm, topic);
+            }
+            EventResponseType::DkgRound3 => {
+                todo!()
             }
         }
         return Ok(());
@@ -374,11 +480,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         handle_ping(&mut swarm, topic.clone()).await;
                     }
                     "dkg" => {
-                        // Starting by adding your own package to the group packages
-                        // dkg_state_machine.group_packages.insert(
-                        //     dkg_state_machine.personal_identifier,
-                        //     dkg_state_machine.personal_round1_package.clone(),
-                        // );
                         dkg_state_machine.next_state(DKGEvent::Round1, &mut swarm, topic.hash());
                     }
                     _ => println!("Sending message: {}", line),
