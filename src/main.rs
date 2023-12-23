@@ -6,6 +6,7 @@ use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::error::Error;
 use std::hash::{Hash, Hasher};
 use std::str::FromStr;
@@ -50,14 +51,17 @@ struct DKGStateMachine {
     personal_identifier: frost::Identifier,
     personal_secret_package: frost::keys::dkg::round1::SecretPackage,
     personal_round1_package: frost::keys::dkg::round1::Package,
-    group_packages: Vec<frost::keys::dkg::round1::Package>,
+    group_packages: HashMap<frost::Identifier, frost::keys::dkg::round1::Package>,
+}
+
+fn peer_id_to_identifier(peer_id: &PeerId) -> frost::Identifier {
+    frost::Identifier::derive(peer_id.to_bytes().as_ref()).expect("can derive identifier")
 }
 
 impl DKGStateMachine {
-    pub fn new(min_signers: u16, max_signers: u16, personal_id_bytes: &[u8]) -> Self {
+    pub fn new(min_signers: u16, max_signers: u16, peer_id: &PeerId) -> Self {
         let mut rng = thread_rng();
-        let personal_identifier =
-            frost::Identifier::derive(personal_id_bytes).expect("can derive identifier");
+        let personal_identifier = peer_id_to_identifier(peer_id);
         let (personal_secret_package, personal_round1_package) =
             frost::keys::dkg::part1(personal_identifier, min_signers, max_signers, &mut rng)
                 .unwrap();
@@ -68,7 +72,7 @@ impl DKGStateMachine {
             personal_secret_package,
             personal_round1_package,
             personal_identifier,
-            group_packages: vec![],
+            group_packages: HashMap::new(),
         }
     }
 }
@@ -81,15 +85,12 @@ impl DKGStateMachine {
             | (DKGState::Start, DKGEvent::Round1)
             | (DKGState::Round1, DKGEvent::Round1)
             | (DKGState::Initial, DKGEvent::Round1) => {
-                if self.group_packages.len() >= self.max_signers as usize {
+                self.state = DKGState::Round1;
+                if self.group_packages.len() >= (self.max_signers - 1) as usize {
                     info!("Progressing to round 2");
                     self.next_state(DKGEvent::Round2, swarm, topic);
                     return;
                 }
-                // Starting by adding your own package to the group packages
-                self.group_packages
-                    .push(self.personal_round1_package.clone());
-
                 info!("Starting DKG, sending round 1 package to all peers");
                 // Broadcast dkg round 1 package to all peers
                 let response = Response {
@@ -103,10 +104,16 @@ impl DKGStateMachine {
                     .gossipsub
                     .publish(topic.clone(), json.as_bytes())
                     .unwrap();
-                self.state = DKGState::Round1;
             }
             (DKGState::Round1, DKGEvent::Round2) => {
                 info!("Attempting to start round 2");
+                let (round2_secret_package, round2_packages) = frost::keys::dkg::part2(
+                    self.personal_secret_package.clone(),
+                    &self.group_packages,
+                )
+                .expect("can start round 2");
+
+                println!("round2_packages: {:?}", round2_packages);
             }
             // TODO for round 2, 3
             _ => panic!("Invalid transition"),
@@ -155,8 +162,6 @@ struct Response<T> {
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 enum EventRequestType {
     Ping,
-    // Event for everyone to start DKG by sharing their coefficients
-    StartDkg,
 }
 
 impl FromStr for EventRequestType {
@@ -165,7 +170,6 @@ impl FromStr for EventRequestType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "Ping" => Ok(EventRequestType::Ping),
-            "StartDkg" => Ok(EventRequestType::StartDkg),
             _ => Err(()),
         }
     }
@@ -239,11 +243,6 @@ async fn handle_request(
                 info!("Got ping from peer: {peer_id}");
                 handle_pong(swarm, topic, peer_id).await;
             }
-            EventRequestType::StartDkg => {
-                info!("Got Intent to start DKG from peer: {peer_id}");
-                // Nothing to parse just progress to round 1
-                dkg_state_machine.next_state(DKGEvent::Round1, swarm, topic);
-            }
         }
         return Ok(());
     }
@@ -267,7 +266,6 @@ async fn handle_response(
             .map_err(|e| RequestResponseParsingError::UnableToParse)?;
 
         debug!("resp_type: {:?}", resp_type);
-
         match resp_type {
             EventResponseType::Pong => {
                 info!("Got pong from peer: {peer_id}");
@@ -288,7 +286,9 @@ async fn handle_response(
                         println!("Unable to parse round 1 package: {:?}", e);
                         RequestResponseParsingError::CouldNotParseRound1Package
                     })?;
-                dkg_state_machine.group_packages.push(package);
+                dkg_state_machine
+                    .group_packages
+                    .insert(peer_id_to_identifier(&peer_id), package);
                 dkg_state_machine.next_state(DKGEvent::Round1, swarm, topic);
             }
         }
@@ -344,8 +344,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // Create a Gossipsub topic
     let topic = gossipsub::IdentTopic::new("frost");
-    let dkg_state_machine =
-        &mut DKGStateMachine::new(2, 2, swarm.local_peer_id().to_bytes().as_ref());
+    let dkg_state_machine = &mut DKGStateMachine::new(2, 2, &swarm.local_peer_id());
 
     // subscribes to our topic
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
@@ -374,6 +373,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         handle_ping(&mut swarm, topic.clone()).await;
                     }
                     "dkg" => {
+                        // Starting by adding your own package to the group packages
+                        // dkg_state_machine.group_packages.insert(
+                        //     dkg_state_machine.personal_identifier,
+                        //     dkg_state_machine.personal_round1_package.clone(),
+                        // );
                         dkg_state_machine.next_state(DKGEvent::Start, &mut swarm, topic.hash());
                     }
                     _ => println!("Sending message: {}", line),
