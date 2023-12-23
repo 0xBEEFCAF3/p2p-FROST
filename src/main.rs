@@ -34,6 +34,7 @@ pub enum DKGEvent {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DKGState {
     Initial,
+    Start,
     Round1,
     Round2,
     Round3,
@@ -76,23 +77,36 @@ impl DKGStateMachine {
     fn next_state(&mut self, event: DKGEvent, swarm: &mut Swarm<FrostBehaviour>, topic: TopicHash) {
         match (self.state, event) {
             // Define state transitions based on events
-            (DKGState::Initial, DKGEvent::Round1) => {
+            (DKGState::Initial, DKGEvent::Start)
+            | (DKGState::Start, DKGEvent::Round1)
+            | (DKGState::Round1, DKGEvent::Round1)
+            | (DKGState::Initial, DKGEvent::Round1) => {
+                if self.group_packages.len() >= self.max_signers as usize {
+                    info!("Progressing to round 2");
+                    self.next_state(DKGEvent::Round2, swarm, topic);
+                    return;
+                }
+                // Starting by adding your own package to the group packages
+                self.group_packages
+                    .push(self.personal_round1_package.clone());
+
                 info!("Starting DKG, sending round 1 package to all peers");
-                let request = Request {
-                    request_type: EventRequestType::DkgRound1,
-                    data: Some(
-                        serde_json::to_string(&self.personal_round1_package)
-                            .expect("can jsonify request"),
-                    ),
+                // Broadcast dkg round 1 package to all peers
+                let response = Response {
+                    response_type: EventResponseType::DkgRound1,
+                    data: Some(self.personal_round1_package.clone()),
+                    receiver: None,
                 };
-                let json = serde_json::to_string(&request).expect("can jsonify request");
-                // Broadcast to all peers
+                let json = serde_json::to_string(&response).expect("can jsonify request");
                 swarm
                     .behaviour_mut()
                     .gossipsub
-                    .publish(topic.clone(), json.as_bytes());
-
+                    .publish(topic.clone(), json.as_bytes())
+                    .unwrap();
                 self.state = DKGState::Round1;
+            }
+            (DKGState::Round1, DKGEvent::Round2) => {
+                info!("Attempting to start round 2");
             }
             // TODO for round 2, 3
             _ => panic!("Invalid transition"),
@@ -134,15 +148,15 @@ struct DKGRound1ResponsePackage {
 struct Response<T> {
     response_type: EventResponseType,
     data: Option<T>,
-    // peer id for who should recieve
-    receiver: String,
+    // peer id for who should recieve, optional if this is a broadcast to all peers
+    receiver: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 enum EventRequestType {
     Ping,
     // Event for everyone to start DKG by sharing their coefficients
-    DkgRound1,
+    StartDkg,
 }
 
 impl FromStr for EventRequestType {
@@ -151,7 +165,7 @@ impl FromStr for EventRequestType {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "Ping" => Ok(EventRequestType::Ping),
-            "DkgRound1" => Ok(EventRequestType::DkgRound1),
+            "StartDkg" => Ok(EventRequestType::StartDkg),
             _ => Err(()),
         }
     }
@@ -174,32 +188,31 @@ async fn handle_ping<H: libp2p::gossipsub::Hasher>(
         data: None,
     };
     let json = serde_json::to_string(&request).expect("can jsonify request");
-
-    debug!("json: {}", json);
     swarm
         .behaviour_mut()
         .gossipsub
-        .publish(topic, json.as_bytes());
+        .publish(topic, json.as_bytes())
+        .unwrap();
 }
 
 async fn handle_pong(swarm: &mut Swarm<FrostBehaviour>, topic: TopicHash, peer_id: PeerId) {
     info!("Sending Pong");
     let request: Response<Option<String>> = Response {
         response_type: EventResponseType::Pong,
-        receiver: peer_id.to_string(),
+        receiver: Some(peer_id.to_string()),
         data: None,
     };
     let json = serde_json::to_string(&request).expect("can jsonify request");
-
-    debug!("json: {}", json);
     swarm
         .behaviour_mut()
         .gossipsub
-        .publish(topic, json.as_bytes());
+        .publish(topic, json.as_bytes())
+        .unwrap();
 }
 
 enum RequestResponseParsingError {
     UnableToParse,
+    CouldNotParseRound1Package,
 }
 
 async fn handle_request(
@@ -209,6 +222,10 @@ async fn handle_request(
     topic: TopicHash,
     peer_id: PeerId,
 ) -> Result<(), RequestResponseParsingError> {
+    if peer_id == *swarm.local_peer_id() {
+        debug!("Got our own request back, skipping");
+        return Ok(());
+    }
     let parsed: Value =
         serde_json::from_slice(&payload).map_err(|e| RequestResponseParsingError::UnableToParse)?;
     if let Some(request_type) = parsed.get("request_type").and_then(|v| v.as_str()) {
@@ -222,14 +239,9 @@ async fn handle_request(
                 info!("Got ping from peer: {peer_id}");
                 handle_pong(swarm, topic, peer_id).await;
             }
-            EventRequestType::DkgRound1 => {
-                info!("Got DKG round 1 from peer: {peer_id}");
-                if peer_id == *swarm.local_peer_id() {
-                    debug!("Got our own round 1 package back");
-                    return Ok(());
-                }
-                // A peer is requesting to start DKG
-                // Assuming we are in init state, otherwise we shouldnt ignore
+            EventRequestType::StartDkg => {
+                info!("Got Intent to start DKG from peer: {peer_id}");
+                // Nothing to parse just progress to round 1
                 dkg_state_machine.next_state(DKGEvent::Round1, swarm, topic);
             }
         }
@@ -250,19 +262,34 @@ async fn handle_response(
         serde_json::from_slice(&payload).map_err(|e| RequestResponseParsingError::UnableToParse)?;
     if let Some(request_type) = parsed.get("response_type").and_then(|v| v.as_str()) {
         // parse back into enum variant
-        let req_type = request_type
+        let resp_type = request_type
             .parse::<EventResponseType>()
             .map_err(|e| RequestResponseParsingError::UnableToParse)?;
 
-        println!("req_type: {:?}", req_type);
+        debug!("resp_type: {:?}", resp_type);
 
-        match req_type {
+        match resp_type {
             EventResponseType::Pong => {
                 info!("Got pong from peer: {peer_id}");
                 // Nothing else to do
             }
             EventResponseType::DkgRound1 => {
-                todo!();
+                info!("Got DKG round 1 from peer: {peer_id}");
+                if peer_id == *swarm.local_peer_id() {
+                    debug!("Got our own round 1 package back");
+                    // This package should already be in our list
+                    return Ok(());
+                }
+                let value = parsed.get("data").expect("can get data").to_string();
+                let package_bytes = value.as_bytes();
+
+                let package: frost::keys::dkg::round1::Package =
+                    serde_json::from_slice(package_bytes).map_err(|e| {
+                        println!("Unable to parse round 1 package: {:?}", e);
+                        RequestResponseParsingError::CouldNotParseRound1Package
+                    })?;
+                dkg_state_machine.group_packages.push(package);
+                dkg_state_machine.next_state(DKGEvent::Round1, swarm, topic);
             }
         }
         return Ok(());
@@ -320,8 +347,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let dkg_state_machine =
         &mut DKGStateMachine::new(2, 2, swarm.local_peer_id().to_bytes().as_ref());
 
-    println!("dkg_state_machine: {:?}", dkg_state_machine);
-
     // subscribes to our topic
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
@@ -349,14 +374,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         handle_ping(&mut swarm, topic.clone()).await;
                     }
                     "dkg" => {
-                        dkg_state_machine.next_state(DKGEvent::Round1, &mut swarm, topic.hash());
+                        dkg_state_machine.next_state(DKGEvent::Start, &mut swarm, topic.hash());
                     }
                     _ => println!("Sending message: {}", line),
-                }
-                if let Err(e) = swarm
-                    .behaviour_mut().gossipsub
-                    .publish(topic.clone(), line.as_bytes()) {
-                    println!("Publish error: {e:?}");
                 }
             }
             event = swarm.select_next_some() => match event {
