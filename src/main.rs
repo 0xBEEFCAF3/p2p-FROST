@@ -35,7 +35,6 @@ pub enum DKGEvent {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DKGState {
     Initial,
-    Start,
     Round1,
     Round2,
     Round3,
@@ -81,16 +80,9 @@ impl DKGStateMachine {
     fn next_state(&mut self, event: DKGEvent, swarm: &mut Swarm<FrostBehaviour>, topic: TopicHash) {
         match (self.state, event) {
             // Define state transitions based on events
-            (DKGState::Initial, DKGEvent::Start)
-            | (DKGState::Start, DKGEvent::Round1)
-            | (DKGState::Round1, DKGEvent::Round1)
-            | (DKGState::Initial, DKGEvent::Round1) => {
+            (DKGState::Initial, DKGEvent::Round1) | (DKGState::Round1, DKGEvent::Round1) => {
+                info!("GROUP PACKAGES:::: {:?}", self.group_packages);
                 self.state = DKGState::Round1;
-                if self.group_packages.len() >= (self.max_signers - 1) as usize {
-                    info!("Progressing to round 2");
-                    self.next_state(DKGEvent::Round2, swarm, topic);
-                    return;
-                }
                 info!("Starting DKG, sending round 1 package to all peers");
                 // Broadcast dkg round 1 package to all peers
                 let response = Response {
@@ -102,8 +94,15 @@ impl DKGStateMachine {
                 swarm
                     .behaviour_mut()
                     .gossipsub
-                    .publish(topic.clone(), json.as_bytes())
-                    .unwrap();
+                    .publish(topic.clone(), json.as_bytes());
+                    // .unwrap();
+
+                // Check if we are ready to progress to round 2
+                if self.group_packages.len() >= (self.max_signers - 1) as usize {
+                    info!("Progressing to round 2");
+                    self.next_state(DKGEvent::Round2, swarm, topic);
+                    return;
+                }
             }
             (DKGState::Round1, DKGEvent::Round2) => {
                 info!("Attempting to start round 2");
@@ -113,6 +112,8 @@ impl DKGStateMachine {
                 )
                 .expect("can start round 2");
 
+
+                    
                 println!("round2_packages: {:?}", round2_packages);
             }
             // TODO for round 2, 3
@@ -378,7 +379,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         //     dkg_state_machine.personal_identifier,
                         //     dkg_state_machine.personal_round1_package.clone(),
                         // );
-                        dkg_state_machine.next_state(DKGEvent::Start, &mut swarm, topic.hash());
+                        dkg_state_machine.next_state(DKGEvent::Round1, &mut swarm, topic.hash());
                     }
                     _ => println!("Sending message: {}", line),
                 }
