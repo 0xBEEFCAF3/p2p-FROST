@@ -56,8 +56,8 @@ struct DKGStateMachine {
     round1_group_packages: HashMap<frost::Identifier, frost::keys::dkg::round1::Package>,
     round2_group_packages: HashMap<frost::Identifier, frost::keys::dkg::round2::Package>,
     round2_group_secret_package: Option<frost::keys::dkg::round2::SecretPackage>,
-    key_package: Option<frost::keys::dkg::round3::KeyPackage>,
-    pubkey_package: Option<frost::keys::dkg::round3::PubkeyPackage>,
+    key_package: Option<frost::keys::KeyPackage>,
+    public_key_package: Option<frost::keys::PublicKeyPackage>,
 }
 
 fn peer_id_to_identifier(peer_id: &PeerId) -> frost::Identifier {
@@ -83,7 +83,7 @@ impl DKGStateMachine {
             round2_group_packages: HashMap::new(),
             round2_group_secret_package: None,
             key_package: None,
-            pubkey_package: None,
+            public_key_package: None,
         }
     }
 }
@@ -171,7 +171,7 @@ impl DKGStateMachine {
                 info!("round1 pkgs {:?}", self.round1_group_packages);
                 info!("round2 pkgs {:?}", self.round2_group_packages);
 
-                let (key_package, pubkey_package) = frost::keys::dkg::part3(
+                let (key_package, public_key_package) = frost::keys::dkg::part3(
                     &self
                         .round2_group_secret_package
                         .clone()
@@ -182,9 +182,9 @@ impl DKGStateMachine {
                 .unwrap();
 
                 info!("key_package: {:?}", key_package);
-                info!("pubkey_package: {:?}", pubkey_package);
+                info!("pubkey_package: {:?}", public_key_package);
                 self.key_package = Some(key_package.clone());
-                self.pubkey_package = Some(pubkey_package.clone());
+                self.public_key_package= Some(public_key_package.clone());
             }
 
             _ => panic!("Invalid transition"),
