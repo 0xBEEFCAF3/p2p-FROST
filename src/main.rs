@@ -311,7 +311,8 @@ impl SigningStateMachine {
                     .unwrap();
                 self.state = SigningState::Success;
 
-                
+                info!("Signature: {:?}", signature);
+                self.public_key_package.group_public().verify(self.signing_pacakge.as_slice(), signature).expect("valid signature");
             }
 
             _ => panic!("Invalid transition"),
