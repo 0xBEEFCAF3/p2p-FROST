@@ -3,7 +3,7 @@ use futures::stream::StreamExt;
 use libp2p::gossipsub::{Event, Topic, TopicHash};
 use libp2p::{gossipsub, mdns, noise, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux};
 use libp2p::{PeerId, Swarm};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
@@ -184,11 +184,61 @@ impl DKGStateMachine {
                 info!("key_package: {:?}", key_package);
                 info!("pubkey_package: {:?}", public_key_package);
                 self.key_package = Some(key_package.clone());
-                self.public_key_package= Some(public_key_package.clone());
+                self.public_key_package = Some(public_key_package.clone());
             }
 
             _ => panic!("Invalid transition"),
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SigningState {
+    Initial,
+    Round1Start,
+    Round1Waiting,
+    Round2Start,
+    Round2Waiting,
+    Success,
+    SigningFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SigningEvent {
+    Start,
+    Round1,
+    Round2,
+    SigningFailed,
+}
+
+struct SigningStateMachine {
+    state: SigningState,
+    public_key_package: frost::keys::PublicKeyPackage,
+    key_package: frost::keys::KeyPackage,
+    message: Vec<u8>,
+    signing_pacakge: Option<frost::SigningPackage>,
+    is_cordinator: bool,
+}
+
+impl SigningStateMachine {
+    pub fn new(
+        public_key_package: frost::keys::PublicKeyPackage,
+        key_package: frost::keys::KeyPackage,
+        message: Vec<u8>,
+        is_cordinator: bool,
+    ) -> Self {
+        Self {
+            state: SigningState::Initial,
+            public_key_package,
+            key_package,
+            is_cordinator: false,
+            message,
+            signing_pacakge: None,
+        }
+    }
+
+    pub fn set_is_cordinator(&mut self, value: bool) {
+        self.is_cordinator = value;
     }
 }
 
@@ -242,6 +292,7 @@ struct Response<T> {
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
 enum EventRequestType {
     Ping,
+    SigningRound1,
 }
 
 impl FromStr for EventRequestType {
@@ -260,6 +311,23 @@ impl FromStr for EventRequestType {
 struct Request<T> {
     request_type: EventRequestType,
     data: Option<T>,
+}
+
+async fn handle_signing_round1_request<H: libp2p::gossipsub::Hasher>(
+    swarm: &mut Swarm<FrostBehaviour>,
+    topic: Topic<H>,
+) {
+    info!("Sending signing round 1 request");
+    let request: Request<Option<String>> = Request {
+        request_type: EventRequestType::SigningRound1,
+        data: None,
+    };
+    let json = serde_json::to_string(&request).expect("can jsonify request");
+    swarm
+        .behaviour_mut()
+        .gossipsub
+        .publish(topic, json.as_bytes())
+        .unwrap();
 }
 
 async fn handle_ping<H: libp2p::gossipsub::Hasher>(
@@ -323,6 +391,13 @@ async fn handle_request(
             EventRequestType::Ping => {
                 info!("Got ping from peer: {peer_id}");
                 handle_pong(swarm, topic, peer_id).await;
+            }
+            EventRequestType::SigningRound1 => {
+                info!("Got signing round 1 request from peer: {peer_id}");
+                if peer_id == *swarm.local_peer_id() {
+                    debug!("Got our own round 1 request back");
+                    return Ok(());
+                }
             }
         }
         return Ok(());
@@ -469,12 +544,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
     swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
     swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
 
-    println!("Enter messages via STDIN and they will be sent to connected peers using Gossipsub");
+    info!("Enter messages via STDIN");
+    info!("Type 'ls p' to list connected peers");
+    info!("Type 'ping' to send a ping to all peers");
+    info!("Type 'dkg' to start the DKG process");
+    info!("Type 'sign <message>' to sign a message");
 
     // Kick it off
     loop {
         select! {
             Ok(Some(line)) = stdin.next_line() => {
+                if line.starts_with("sign") {
+                    if (dkg_state_machine.public_key_package.is_none()) {
+                        warn!("Key generation step must be performed first");
+                        continue;
+                    }
+                    if let Some(rest) = line.strip_prefix("sign") {
+                        let message = rest.trim();
+                        if message.is_empty() {
+                            warn!("Message must not be empty");
+                            continue;
+                        }
+                        info!("Signing message: {}", message);
+                    }
+                    continue;
+                }
                 match line.as_str() {
                     "ls p" => {
                         println!("Connected peers:");
@@ -486,6 +580,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         handle_ping(&mut swarm, topic.clone()).await;
                     }
                     "dkg" => {
+                        dkg_state_machine.next_state(DKGEvent::Round1, &mut swarm, topic.hash());
+                    }
+                    "sign" => {
                         dkg_state_machine.next_state(DKGEvent::Round1, &mut swarm, topic.hash());
                     }
                     _ => println!("Sending message: {}", line),
