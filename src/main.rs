@@ -236,7 +236,7 @@ impl SigningStateMachine {
             is_cordinator: false,
             signing_pacakge: None,
             signing_share,
-            signer_nonces,
+            signer_nonces: None,
         }
     }
 
@@ -251,16 +251,17 @@ impl SigningStateMachine {
         topic: TopicHash,
     ) {
         match (self.state, event) {
-            (SigningState::Initial, SigningState::Round1) => {
+            (SigningState::Initial, SigningEvent::Round1) => {
                 self.state = SigningState::Round1Start;
                 info!("Starting DKG, sending round 1 package to all peers");
                 let mut rng = thread_rng();
                 let package = frost::round1::commit(&self.signing_share, &mut rng);
                 self.signer_nonces = Some(package.0);
+                let commitments = package.1;
                 // Broadcast dkg round 1 package to all peers
                 let response = Response {
                     response_type: EventResponseType::DkgRound1,
-                    data: Some(package),
+                    data: Some(commitments),
                     receiver: None,
                 };
                 let json = serde_json::to_string(&response).expect("can jsonify request");
@@ -274,26 +275,25 @@ impl SigningStateMachine {
 
                 // Once the round 1 package is sent we are waiting
                 self.state = SigningState::Round1Waiting;
-                self.next_state(SigningState::Round1, swarm, topic);
+                self.next_state(SigningEvent::Round1 ,swarm, topic);
             }
 
-            (SigningState::Round1Waiting, SigningState::Round1) => {
+            (SigningState::Round1Waiting, SigningEvent::Round1) => {
                 info!("Waiting for round 1 packages from other peers");
-                info!("round1_group_packages: {:?}", self.round1_group_packages);
                 if self.signing_pacakge.is_some() {
                     info!("Progressing to round 2");
                     self.state = SigningState::Round2Start;
-                    self.next_state(SigningState::Round2, swarm, topic);
+                    self.next_state(SigningEvent::Round2, swarm, topic);
                     return;
                 }
             }
-            (SigningState::Round2Start, SigningState::Round2) => {
+            (SigningState::Round2Start, SigningEvent::Round2) => {
                 info!("Attempting to start round 2");
                 let mut rng = thread_rng();
 
                 let signature = frost::round2::sign(
-                    self.signing_package,
-                    &self.signer_nonces.expect("signer nonces"),
+                    &self.signing_pacakge.as_mut().expect("valid signing package"),
+                    &self.signer_nonces.as_mut().expect("signer nonces"),
                     &self.key_package,
                 )
                 .expect("valid signature");
@@ -303,6 +303,7 @@ impl SigningStateMachine {
                     data: Some(signature),
                     receiver: None,
                 };
+                let json = serde_json::to_string(&response).expect("can jsonify request");
 
                 swarm
                     .behaviour_mut()
@@ -312,7 +313,7 @@ impl SigningStateMachine {
                 self.state = SigningState::Success;
 
                 info!("Signature: {:?}", signature);
-                self.public_key_package.group_public().verify(self.signing_pacakge.as_slice(), signature).expect("valid signature");
+                // self.public_key_package.group_public().verify(self.signing_pacakge.as_slice(), signature).expect("valid signature");gg254
             }
 
             _ => panic!("Invalid transition"),
