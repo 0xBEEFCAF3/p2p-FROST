@@ -295,7 +295,23 @@ impl SigningStateMachine {
                     self.signing_package,
                     &self.signer_nonces.expect("signer nonces"),
                     &self.key_package,
-                ).expect("valid signature");
+                )
+                .expect("valid signature");
+
+                let response = Response {
+                    response_type: EventResponseType::DkgRound2,
+                    data: Some(signature),
+                    receiver: None,
+                };
+
+                swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(topic.clone(), json.as_bytes())
+                    .unwrap();
+                self.state = SigningState::Success;
+
+                
             }
 
             _ => panic!("Invalid transition"),
