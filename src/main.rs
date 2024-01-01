@@ -44,7 +44,6 @@ pub enum DKGState {
     DkgFailed,
 }
 
-// Implement the state machine using rust-fsm
 #[derive(Debug, Clone)]
 struct DKGStateMachine {
     state: DKGState,
@@ -213,35 +212,48 @@ pub enum SigningEvent {
 
 struct SigningStateMachine {
     state: SigningState,
-    public_key_package: frost::keys::PublicKeyPackage,
-    key_package: frost::keys::KeyPackage,
-    signing_pacakge: Option<frost::SigningPackage>,
-    signing_share: frost::keys::SigningShare,
     is_cordinator: bool,
+    public_key_package: Option<frost::keys::PublicKeyPackage>,
+    key_package: Option<frost::keys::KeyPackage>,
+    signing_pacakge: Option<frost::SigningPackage>,
+    signing_share: Option<frost::keys::SigningShare>,
     signer_nonces: Option<frost::round1::SigningNonces>,
 }
 
 impl SigningStateMachine {
     pub fn new(
-        public_key_package: frost::keys::PublicKeyPackage,
-        key_package: frost::keys::KeyPackage,
-        message: Vec<u8>,
-        is_cordinator: bool,
-        signing_share: frost::keys::SigningShare,
     ) -> Self {
         Self {
             state: SigningState::Initial,
-            public_key_package,
-            key_package,
             is_cordinator: false,
+            public_key_package: None,
+            key_package: None,
             signing_pacakge: None,
-            signing_share,
+            signing_share: None,
             signer_nonces: None,
         }
     }
 
-    pub fn set_is_cordinator(&mut self, value: bool) {
-        self.is_cordinator = value;
+    pub fn update_fields_from_dkg_state_machine(&mut self, dkg_state_machine: &DKGStateMachine) {
+        self.public_key_package = dkg_state_machine.public_key_package.clone();
+        self.key_package = dkg_state_machine.key_package.clone();
+    }
+
+    pub fn set_is_cordinator(&mut self) {
+        self.is_cordinator = true;
+    }
+
+    pub fn set_key_package(&mut self, key_package: frost::keys::KeyPackage) {
+        self.key_package = Some(key_package);
+    }
+
+  
+    pub fn set_signing_share(&mut self, signing_share: frost::keys::SigningShare) {
+        self.signing_share = Some(signing_share);
+    }
+
+    pub fn set_public_key_package(&mut self, public_key_package: frost::keys::PublicKeyPackage) {
+        self.public_key_package = Some(public_key_package);
     }
 
     fn next_state(
@@ -252,15 +264,21 @@ impl SigningStateMachine {
     ) {
         match (self.state, event) {
             (SigningState::Initial, SigningEvent::Round1) => {
+                if self.signing_share.is_none() {
+                    warn!("Signing share must be set before starting signing");
+                    return;
+                }
+
                 self.state = SigningState::Round1Start;
-                info!("Starting DKG, sending round 1 package to all peers");
+                info!("Starting signing, sending round 1 nonce commitments to all peers");
+                // Create and broadcast nonce commitments pairs to all peers
                 let mut rng = thread_rng();
-                let package = frost::round1::commit(&self.signing_share, &mut rng);
+                let package = frost::round1::commit(&self.signing_share.expect("valid signing share"), &mut rng);
                 self.signer_nonces = Some(package.0);
                 let commitments = package.1;
                 // Broadcast dkg round 1 package to all peers
                 let response = Response {
-                    response_type: EventResponseType::DkgRound1,
+                    response_type: EventResponseType::SigningRound1,
                     data: Some(commitments),
                     receiver: None,
                 };
@@ -273,28 +291,52 @@ impl SigningStateMachine {
                 info!("Round 1 Package send! {:?}", json);
                 std::thread::sleep(std::time::Duration::from_secs(1));
 
-                // Once the round 1 package is sent we are waiting
+                // Once the round 1 commitments are sent we are waiting
                 self.state = SigningState::Round1Waiting;
                 self.next_state(SigningEvent::Round1 ,swarm, topic);
             }
 
             (SigningState::Round1Waiting, SigningEvent::Round1) => {
+                // If we are the cordinator we are waiting for all other peers to send their commitments
+                // If we are peer that is just signing we are waiting for the cordinator to signing package
                 info!("Waiting for round 1 packages from other peers");
-                if self.signing_pacakge.is_some() {
-                    info!("Progressing to round 2");
-                    self.state = SigningState::Round2Start;
-                    self.next_state(SigningEvent::Round2, swarm, topic);
-                    return;
+                if self.is_cordinator {
+
+                } else {
+                    if self.signing_pacakge.is_some() {
+                        info!("Progressing to round 2");
+                        self.state = SigningState::Round2Start;
+                        self.next_state(SigningEvent::Round2, swarm, topic);
+                        return;
+                    }
                 }
+                
             }
             (SigningState::Round2Start, SigningEvent::Round2) => {
-                info!("Attempting to start round 2");
+                info!("Signing: Attempting to start round 2");
+                if self.key_package.is_none() {
+                    warn!("Key package must be set before starting signing");
+                    return;
+                }
+                if self.public_key_package.is_none() {
+                    warn!("Public key package must be set before starting signing");
+                    return;
+                }
+                if self.signer_nonces.is_none() {
+                    warn!("Signer nonces must be set before starting signing");
+                    return;
+                }
+                if self.signing_pacakge.is_none() {
+                    warn!("Signing package must be set before starting signing");
+                    return;
+                }
+
                 let mut rng = thread_rng();
 
                 let signature = frost::round2::sign(
                     &self.signing_pacakge.as_mut().expect("valid signing package"),
                     &self.signer_nonces.as_mut().expect("signer nonces"),
-                    &self.key_package,
+                    &self.key_package.as_mut().expect("valid key package"),
                 )
                 .expect("valid signature");
 
@@ -334,6 +376,8 @@ enum EventResponseType {
     DkgRound1,
     DkgRound2,
     DkgRound3,
+    SigningRound1,
+    SigningRound2,
 }
 
 impl FromStr for EventResponseType {
@@ -345,6 +389,8 @@ impl FromStr for EventResponseType {
             "DkgRound1" => Ok(EventResponseType::DkgRound1),
             "DkgRound2" => Ok(EventResponseType::DkgRound2),
             "DkgRound3" => Ok(EventResponseType::DkgRound3),
+            "SigningRound1" => Ok(EventResponseType::SigningRound1),
+            "SigningRound2" => Ok(EventResponseType::SigningRound2),
             _ => Err(()),
         }
     }
@@ -488,6 +534,7 @@ async fn handle_request(
 async fn handle_response(
     payload: Vec<u8>,
     dkg_state_machine: &mut DKGStateMachine,
+    signing_state_machine: &mut SigningStateMachine,
     swarm: &mut Swarm<FrostBehaviour>,
     topic: TopicHash,
     peer_id: PeerId,
@@ -558,6 +605,29 @@ async fn handle_response(
             EventResponseType::DkgRound3 => {
                 todo!()
             }
+            EventResponseType::SigningRound1 => {
+                info!("Got signing round 1 from peer: {peer_id}");
+                if peer_id == *swarm.local_peer_id() {
+                    debug!("Got our own round 1 package back");
+                    // This package should already be in our list
+                    return Ok(());
+                }
+                let nonce_pair: frost::round1::SigningCommitments = serde_json::from_slice(package_bytes).map_err(|e| {
+                    println!("Unable to parse round 1 package: {:?}", e);
+                    RequestResponseParsingError::CouldNotParseRound1Package
+                })?;
+                info!("nonce_pair: {:?}", nonce_pair);
+
+
+
+                signing_state_machine.next_state(SigningEvent::Round1, swarm, topic);
+            }
+            EventResponseType::SigningRound2 => {
+                todo!()
+            }
+            _ => {
+                panic!("Invalid response type")
+            }
         }
         return Ok(());
     }
@@ -612,6 +682,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Create a Gossipsub topic
     let topic = gossipsub::IdentTopic::new("frost");
     let dkg_state_machine = &mut DKGStateMachine::new(2, 2, &swarm.local_peer_id());
+    let signing_state_machine = &mut SigningStateMachine::new();
 
     // subscribes to our topic
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
@@ -650,9 +721,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 }
                 match line.as_str() {
                     "ls p" => {
-                        println!("Connected peers:");
+                        info!("Connected peers:");
                         for peer in swarm.behaviour_mut().gossipsub.all_peers() {
-                            println!("{:?}", peer);
+                            info!("{:?}", peer);
                         }
                     }
                     "ping" => {
@@ -662,7 +733,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         dkg_state_machine.next_state(DKGEvent::Round1, &mut swarm, topic.hash());
                     }
                     "sign" => {
-                        dkg_state_machine.next_state(DKGEvent::Round1, &mut swarm, topic.hash());
+                        // Set that we are cordinating the singing effor
+                        signing_state_machine.set_is_cordinator();
+                        signing_state_machine.update_fields_from_dkg_state_machine(dkg_state_machine);
+                        signing_state_machine.next_state(SigningEvent::Round1, &mut swarm, topic.hash());
                     }
                     _ => println!("Sending message: {}", line),
                 }
@@ -695,7 +769,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     );
                     if let Ok(_) = handle_request(message.data.clone(), dkg_state_machine, &mut swarm, topic.hash(), peer_id).await {
                         info!("Successfully handled request");
-                    } else if let Ok(_) = handle_response(message.data.clone(), dkg_state_machine, &mut swarm, topic.hash(), peer_id).await {
+                    } else if let Ok(_) = handle_response(message.data.clone(), dkg_state_machine, signing_state_machine, &mut swarm, topic.hash(), peer_id).await {
                         info!("Successfully handled response");
                     } else {
                         info!("Unable to handle request or response");
