@@ -7,6 +7,7 @@ use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::error::Error;
 use std::hash::{Hash, Hasher};
@@ -213,24 +214,29 @@ pub enum SigningEvent {
 struct SigningStateMachine {
     state: SigningState,
     is_cordinator: bool,
+    personal_identifier: frost::Identifier,
     public_key_package: Option<frost::keys::PublicKeyPackage>,
     key_package: Option<frost::keys::KeyPackage>,
     signing_pacakge: Option<frost::SigningPackage>,
-    signing_share: Option<frost::keys::SigningShare>,
+    message: Vec<u8>,
     signer_nonces: Option<frost::round1::SigningNonces>,
+    peer_signature_shares: BTreeMap<frost::Identifier, frost::round2::SignatureShare>,
+    peer_nonce_commitments: BTreeMap<frost::Identifier, frost::round1::SigningCommitments>,
 }
 
 impl SigningStateMachine {
-    pub fn new(
-    ) -> Self {
+    pub fn new(personal_identifier: frost::Identifier) -> Self {
         Self {
             state: SigningState::Initial,
+            personal_identifier,
             is_cordinator: false,
             public_key_package: None,
             key_package: None,
             signing_pacakge: None,
-            signing_share: None,
+            message: vec![],
             signer_nonces: None,
+            peer_signature_shares: BTreeMap::new(),
+            peer_nonce_commitments: BTreeMap::new(),
         }
     }
 
@@ -247,13 +253,34 @@ impl SigningStateMachine {
         self.key_package = Some(key_package);
     }
 
-  
-    pub fn set_signing_share(&mut self, signing_share: frost::keys::SigningShare) {
-        self.signing_share = Some(signing_share);
-    }
-
     pub fn set_public_key_package(&mut self, public_key_package: frost::keys::PublicKeyPackage) {
         self.public_key_package = Some(public_key_package);
+    }
+
+    pub fn set_message(&mut self, message: Vec<u8>) {
+        self.message = message;
+    }
+
+    fn send_signing_package(&mut self, swarm: &mut Swarm<FrostBehaviour>, topic: TopicHash) {
+        let signing_package = frost::SigningPackage::new(
+            self.peer_nonce_commitments.clone(),
+            self.message.as_slice().as_ref(),
+        );
+        self.signing_pacakge = Some(signing_package.clone());
+
+        let response = Response {
+            response_type: EventResponseType::SigningPackage,
+            data: Some(signing_package),
+            receiver: None,
+        };
+        let json = serde_json::to_string(&response).expect("can jsonify request");
+        swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic.clone(), json.as_bytes())
+            .unwrap();
+        info!("Signing Package send! {:?}", json);
+        std::thread::sleep(std::time::Duration::from_secs(1));
     }
 
     fn next_state(
@@ -264,17 +291,28 @@ impl SigningStateMachine {
     ) {
         match (self.state, event) {
             (SigningState::Initial, SigningEvent::Round1) => {
-                if self.signing_share.is_none() {
-                    warn!("Signing share must be set before starting signing");
+                info!("Attempting to start round 1 of signing");
+                if self.key_package.is_none() {
+                    warn!("key package must be set before starting signing");
                     return;
                 }
-
                 self.state = SigningState::Round1Start;
+
+                let signing_share = self
+                    .key_package
+                    .as_ref()
+                    .expect("valid key package")
+                    .secret_share();
                 info!("Starting signing, sending round 1 nonce commitments to all peers");
                 // Create and broadcast nonce commitments pairs to all peers
                 let mut rng = thread_rng();
-                let package = frost::round1::commit(&self.signing_share.expect("valid signing share"), &mut rng);
+                let package = frost::round1::commit(signing_share, &mut rng);
+                info!("package: {:?}", package.1);
                 self.signer_nonces = Some(package.0);
+                // Add my own commitment
+                self.peer_nonce_commitments
+                    .insert(self.personal_identifier.clone(), package.1.clone());
+
                 let commitments = package.1;
                 // Broadcast dkg round 1 package to all peers
                 let response = Response {
@@ -293,15 +331,32 @@ impl SigningStateMachine {
 
                 // Once the round 1 commitments are sent we are waiting
                 self.state = SigningState::Round1Waiting;
-                self.next_state(SigningEvent::Round1 ,swarm, topic);
+                self.next_state(SigningEvent::Round1, swarm, topic);
             }
 
             (SigningState::Round1Waiting, SigningEvent::Round1) => {
                 // If we are the cordinator we are waiting for all other peers to send their commitments
                 // If we are peer that is just signing we are waiting for the cordinator to signing package
                 info!("Waiting for round 1 packages from other peers");
+                info!(
+                    "peer_nonce_commitments: {:?}",
+                    self.peer_nonce_commitments
+                );
                 if self.is_cordinator {
-
+                    if self.peer_nonce_commitments.len()
+                        >= (self
+                            .key_package
+                            .as_ref()
+                            .expect("valid key package")
+                            .min_signers()).to_owned() as usize
+                    {
+                        info!("Progressing to round 2");
+                        self.state = SigningState::Round2Start;
+                        // As the cordinator we have to send out the signing package
+                        self.send_signing_package(swarm, topic.clone());
+                        self.next_state(SigningEvent::Round2, swarm, topic);
+                        return;
+                    }
                 } else {
                     if self.signing_pacakge.is_some() {
                         info!("Progressing to round 2");
@@ -310,7 +365,6 @@ impl SigningStateMachine {
                         return;
                     }
                 }
-                
             }
             (SigningState::Round2Start, SigningEvent::Round2) => {
                 info!("Signing: Attempting to start round 2");
@@ -334,14 +388,20 @@ impl SigningStateMachine {
                 let mut rng = thread_rng();
 
                 let signature = frost::round2::sign(
-                    &self.signing_pacakge.as_mut().expect("valid signing package"),
+                    &self
+                        .signing_pacakge
+                        .as_mut()
+                        .expect("valid signing package"),
                     &self.signer_nonces.as_mut().expect("signer nonces"),
                     &self.key_package.as_mut().expect("valid key package"),
                 )
                 .expect("valid signature");
 
+                self.peer_signature_shares
+                    .insert(self.personal_identifier.clone(), signature.clone());
+
                 let response = Response {
-                    response_type: EventResponseType::DkgRound2,
+                    response_type: EventResponseType::SigningRound2,
                     data: Some(signature),
                     receiver: None,
                 };
@@ -376,6 +436,7 @@ enum EventResponseType {
     DkgRound1,
     DkgRound2,
     DkgRound3,
+    SigningPackage,
     SigningRound1,
     SigningRound2,
 }
@@ -491,6 +552,7 @@ enum RequestResponseParsingError {
     UnableToParse,
     CouldNotParseRound1Package,
     CouldNotParseRound2Package,
+    CouldNotParseSigningPackage,
 }
 
 async fn handle_request(
@@ -605,6 +667,18 @@ async fn handle_response(
             EventResponseType::DkgRound3 => {
                 todo!()
             }
+            EventResponseType::SigningPackage => {
+                info!("Got signing package from: {peer_id}");
+                let signing_package: frost::SigningPackage = serde_json::from_slice(package_bytes)
+                    .map_err(|e| {
+                        println!("Unable to signing package: {:?}", e);
+                        RequestResponseParsingError::CouldNotParseRound1Package
+                    })?;
+
+                signing_state_machine.signing_pacakge = Some(signing_package.clone());
+                signing_state_machine.next_state(SigningEvent::Round2, swarm, topic);
+            }
+
             EventResponseType::SigningRound1 => {
                 info!("Got signing round 1 from peer: {peer_id}");
                 if peer_id == *swarm.local_peer_id() {
@@ -612,18 +686,35 @@ async fn handle_response(
                     // This package should already be in our list
                     return Ok(());
                 }
-                let nonce_pair: frost::round1::SigningCommitments = serde_json::from_slice(package_bytes).map_err(|e| {
-                    println!("Unable to parse round 1 package: {:?}", e);
-                    RequestResponseParsingError::CouldNotParseRound1Package
-                })?;
+                let nonce_pair: frost::round1::SigningCommitments =
+                    serde_json::from_slice(package_bytes).map_err(|e| {
+                        println!("Unable to parse round 1 package: {:?}", e);
+                        RequestResponseParsingError::CouldNotParseRound1Package
+                    })?;
                 info!("nonce_pair: {:?}", nonce_pair);
-
-
-
+                // set the signing packages
+                signing_state_machine.update_fields_from_dkg_state_machine(dkg_state_machine);
+                signing_state_machine.peer_nonce_commitments.insert(
+                    peer_id_to_identifier(&peer_id),
+                    nonce_pair.clone(),
+                );
                 signing_state_machine.next_state(SigningEvent::Round1, swarm, topic);
             }
             EventResponseType::SigningRound2 => {
-                todo!()
+                info!("Got signing round 2 from peer: {peer_id}");
+                let signature: frost::round2::SignatureShare = serde_json::from_slice(package_bytes).map_err(
+                    |e| {
+                        println!("Unable to parse round 2 package: {:?}", e);
+                        RequestResponseParsingError::CouldNotParseRound2Package
+                    },
+                )?;
+                info!("signature: {:?}", signature);
+                // set the signing packages
+                signing_state_machine.peer_signature_shares.insert(
+                    peer_id_to_identifier(&peer_id),
+                    signature.clone(),
+                );
+                signing_state_machine.next_state(SigningEvent::Round2, swarm, topic);
             }
             _ => {
                 panic!("Invalid response type")
@@ -682,7 +773,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // Create a Gossipsub topic
     let topic = gossipsub::IdentTopic::new("frost");
     let dkg_state_machine = &mut DKGStateMachine::new(2, 2, &swarm.local_peer_id());
-    let signing_state_machine = &mut SigningStateMachine::new();
+    let signing_state_machine =
+        &mut SigningStateMachine::new(dkg_state_machine.personal_identifier.clone());
 
     // subscribes to our topic
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
@@ -716,6 +808,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                             continue;
                         }
                         info!("Signing message: {}", message);
+                        // Set that we are cordinating the singing effor
+                        signing_state_machine.set_is_cordinator();
+                        signing_state_machine.update_fields_from_dkg_state_machine(dkg_state_machine);
+                        signing_state_machine.set_message(message.as_bytes().to_vec());
+                        signing_state_machine.next_state(SigningEvent::Round1, &mut swarm, topic.hash());
+
                     }
                     continue;
                 }
@@ -731,12 +829,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     }
                     "dkg" => {
                         dkg_state_machine.next_state(DKGEvent::Round1, &mut swarm, topic.hash());
-                    }
-                    "sign" => {
-                        // Set that we are cordinating the singing effor
-                        signing_state_machine.set_is_cordinator();
-                        signing_state_machine.update_fields_from_dkg_state_machine(dkg_state_machine);
-                        signing_state_machine.next_state(SigningEvent::Round1, &mut swarm, topic.hash());
                     }
                     _ => println!("Sending message: {}", line),
                 }
