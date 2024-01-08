@@ -220,7 +220,7 @@ struct SigningStateMachine {
     signing_pacakge: Option<frost::SigningPackage>,
     message: Vec<u8>,
     signer_nonces: Option<frost::round1::SigningNonces>,
-    peer_signature_shares: BTreeMap<frost::Identifier, frost::round2::SignatureShare>,
+    peer_signature_shares: HashMap<frost::Identifier, frost::round2::SignatureShare>,
     peer_nonce_commitments: BTreeMap<frost::Identifier, frost::round1::SigningCommitments>,
 }
 
@@ -235,7 +235,7 @@ impl SigningStateMachine {
             signing_pacakge: None,
             message: vec![],
             signer_nonces: None,
-            peer_signature_shares: BTreeMap::new(),
+            peer_signature_shares: HashMap::new(),
             peer_nonce_commitments: BTreeMap::new(),
         }
     }
@@ -334,21 +334,20 @@ impl SigningStateMachine {
                 self.next_state(SigningEvent::Round1, swarm, topic);
             }
 
-            (SigningState::Round1Waiting, SigningEvent::Round1) => {
+            (SigningState::Round1Waiting, SigningEvent::Round1)
+            | (SigningState::Round1Waiting, SigningEvent::Round2) => {
                 // If we are the cordinator we are waiting for all other peers to send their commitments
                 // If we are peer that is just signing we are waiting for the cordinator to signing package
                 info!("Waiting for round 1 packages from other peers");
-                info!(
-                    "peer_nonce_commitments: {:?}",
-                    self.peer_nonce_commitments
-                );
+                info!("peer_nonce_commitments: {:?}", self.peer_nonce_commitments);
                 if self.is_cordinator {
                     if self.peer_nonce_commitments.len()
                         >= (self
                             .key_package
                             .as_ref()
                             .expect("valid key package")
-                            .min_signers()).to_owned() as usize
+                            .min_signers())
+                        .to_owned() as usize
                     {
                         info!("Progressing to round 2");
                         self.state = SigningState::Round2Start;
@@ -412,10 +411,42 @@ impl SigningStateMachine {
                     .gossipsub
                     .publish(topic.clone(), json.as_bytes())
                     .unwrap();
-                self.state = SigningState::Success;
+                self.state = SigningState::Round2Waiting;
 
-                info!("Signature: {:?}", signature);
+                info!("Signature share: {:?}", signature);
                 // self.public_key_package.group_public().verify(self.signing_pacakge.as_slice(), signature).expect("valid signature");gg254
+            }
+
+            (SigningState::Round2Waiting, SigningEvent::Round2) => {
+                info!("Waiting for round 2 partial signatures from other peers");
+                info!("peer_signature_shares: {:?}", self.peer_signature_shares);
+                if self.peer_signature_shares.len()
+                    >= (self
+                        .key_package
+                        .as_ref()
+                        .expect("valid key package")
+                        .min_signers())
+                    .to_owned() as usize
+                {
+                    info!("Progressing to success");
+                    // Any peer can construct the signature share b/c they are all broadcasted
+                    self.state = SigningState::Success;
+                    let group_signature = frost::aggregate(
+                        &self
+                            .signing_pacakge
+                            .as_ref()
+                            .expect("valid signing package"),
+                        &self.peer_signature_shares,
+                        &self.public_key_package.as_ref().expect("pub key package"),
+                    )
+                    .unwrap();
+                    info!("group_signature: {:?}", group_signature);
+                    self.public_key_package.as_ref().expect("valid pub key package").group_public().verify(&self.message.as_slice(), &group_signature).unwrap();
+
+                    info!("Signature verified!");
+
+                    return;
+                }
             }
 
             _ => panic!("Invalid transition"),
@@ -452,6 +483,7 @@ impl FromStr for EventResponseType {
             "DkgRound3" => Ok(EventResponseType::DkgRound3),
             "SigningRound1" => Ok(EventResponseType::SigningRound1),
             "SigningRound2" => Ok(EventResponseType::SigningRound2),
+            "SigningPackage" => Ok(EventResponseType::SigningPackage),
             _ => Err(()),
         }
     }
@@ -694,26 +726,23 @@ async fn handle_response(
                 info!("nonce_pair: {:?}", nonce_pair);
                 // set the signing packages
                 signing_state_machine.update_fields_from_dkg_state_machine(dkg_state_machine);
-                signing_state_machine.peer_nonce_commitments.insert(
-                    peer_id_to_identifier(&peer_id),
-                    nonce_pair.clone(),
-                );
+                signing_state_machine
+                    .peer_nonce_commitments
+                    .insert(peer_id_to_identifier(&peer_id), nonce_pair.clone());
                 signing_state_machine.next_state(SigningEvent::Round1, swarm, topic);
             }
             EventResponseType::SigningRound2 => {
                 info!("Got signing round 2 from peer: {peer_id}");
-                let signature: frost::round2::SignatureShare = serde_json::from_slice(package_bytes).map_err(
-                    |e| {
+                let signature: frost::round2::SignatureShare =
+                    serde_json::from_slice(package_bytes).map_err(|e| {
                         println!("Unable to parse round 2 package: {:?}", e);
                         RequestResponseParsingError::CouldNotParseRound2Package
-                    },
-                )?;
+                    })?;
                 info!("signature: {:?}", signature);
                 // set the signing packages
-                signing_state_machine.peer_signature_shares.insert(
-                    peer_id_to_identifier(&peer_id),
-                    signature.clone(),
-                );
+                signing_state_machine
+                    .peer_signature_shares
+                    .insert(peer_id_to_identifier(&peer_id), signature.clone());
                 signing_state_machine.next_state(SigningEvent::Round2, swarm, topic);
             }
             _ => {
