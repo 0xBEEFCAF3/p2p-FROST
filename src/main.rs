@@ -441,7 +441,12 @@ impl SigningStateMachine {
                     )
                     .unwrap();
                     info!("group_signature: {:?}", group_signature);
-                    self.public_key_package.as_ref().expect("valid pub key package").group_public().verify(&self.message.as_slice(), &group_signature).unwrap();
+                    self.public_key_package
+                        .as_ref()
+                        .expect("valid pub key package")
+                        .group_public()
+                        .verify(&self.message.as_slice(), &group_signature)
+                        .unwrap();
 
                     info!("Signature verified!");
 
